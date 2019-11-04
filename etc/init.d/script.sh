@@ -26,7 +26,7 @@ do
 	ipgprs=`ifconfig | grep -o ppp0`
 done
 ifconfig eth0 down
-ifocnfig wlan0 down
+ifconfig wlan0 down
 route add -net 0.0.0.0 ppp0
 sleep 7
 

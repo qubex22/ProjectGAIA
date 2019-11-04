@@ -1,0 +1,4 @@
+#!/bin/bash
+
+watch -n 120 /home/pi/monitor_ping > /home/pi/ping.txt &
+watch -n 150 /home/pi/monitor_gps > /home/pi/gps.txt &

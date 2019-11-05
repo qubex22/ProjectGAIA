@@ -1,0 +1,291 @@
+#!/usr/bin/perl
+
+# tralnx - Traccar Linux Client
+#
+# Authors:
+#   Thomas Liske <thomas@fiasko-nw.net>
+#   Daniel Till <info@danieltill.de> (some small but essential changes)
+#
+# Copyright Holder:
+#   2013 (C) Thomas Liske <thomas@fiasko-nw.net>
+#
+# License:
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 2 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this package; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+#
+
+use Config;
+use File::Basename;
+use Getopt::Std;
+use GPS::Point;
+use Geo::Inverse;
+use IO::Handle;
+use IO::Socket::INET;
+use Log::Dispatch;
+use Log::Dispatch::Screen;
+use Log::Dispatch::Syslog;
+use Log::Dispatch::File;
+use Net::GPSD3;
+use POSIX qw(strftime mkfifo);
+use Proc::Daemon;
+use Proc::PID::File;
+
+use strict;
+use warnings;
+
+$0 = 'tralnxd';
+
+$|++;
+
+use constant {
+    TRALNX_VERSION => '0.2',
+};
+
+my $logfmt = sub { my %p = @_; chomp($p{'message'}); return ("[$p{level}] $p{message}\n"); };
+my $logffile = sub { my %p = @_;  return (scalar localtime())." [$$] $p{message}"; };
+my $logger = Log::Dispatch->new(callbacks => $logfmt);
+
+my $daemonize;
+END {
+    $logger->notice('terminated') if(defined($logger) && !defined($daemonize));
+}
+
+$logger->add(
+    Log::Dispatch::Screen->new(
+	name => 'console',
+	min_level => 'notice',
+    )
+);
+
+sub mydie($) {
+    $logger->critical(shift);
+    exit 1;
+}
+
+our $opt_c = '/etc/tralnx.conf';
+our $opt_f;
+getopts('fc:');
+mydie("Could not read config file '$opt_c'.") unless(-r $opt_c);
+$logger->info("config file: '$opt_c'");
+
+my %tralnx_conf;
+my %gpsd_conf;
+my %traccar_conf;
+$tralnx_conf{interval} = 5;
+$tralnx_conf{maxinterval} = 60;
+$tralnx_conf{mindist} = 10;
+$tralnx_conf{pospipefmt} = '(defined($lpoint) ? sprintf("%f°%s, %f°%s" . (defined($lpoint->alt) ? ", %.1fm" : ""), $lpoint->lat, ($lpoint->lat < 0 ? "S" : "N"), $lpoint->lon, ($lpoint->lon < 0 ? "W" : "O"), $lpoint->alt) : "")';
+
+eval `cat "$opt_c"`;
+
+# enable log to file
+if(exists($traccar_conf{'logfile'})) {
+    $logger->add(
+	Log::Dispatch::File->new(
+	    name => 'logfile',
+	    min_level => 'info',
+	    filename => $traccar_conf{'logfile'},
+	    close_after_write => '1',
+	    callbacks => $logffile,
+	)
+    );
+}
+# fallback to syslog
+else {
+    $logger->add(
+	Log::Dispatch::Syslog->new(
+	    name => 'syslog',
+	    min_level => 'info',
+	    ident => 'tralnxd',
+	    logopt => 'pid',
+	    facility => 'daemon',
+	)
+    );
+}
+
+$logger->info('tralnxd '.TRALNX_VERSION);
+
+my $lpoint = undef;
+
+if(exists($tralnx_conf{pospipe})) {
+    my ($child, $parent);
+
+    pipe $child, $parent or mydie("pipe() failed: $!");
+    my $pid = fork();
+    mydie("fork() failed: $!") unless defined $pid;
+    if ($pid) {
+	close $child;
+
+	$SIG{USR2} = sub {
+	    $logger->info("got SIGUSR2");
+	    my $data;
+	    eval "\$data = $tralnx_conf{pospipefmt};";
+	    if($@) {
+		$logger->warning("eval('\$data = $tralnx_conf{pospipefmt};') failed: $@");
+		$data = '';
+	    }
+	    else {
+		chomp($data);
+	    }
+
+	    print $parent "$data\n";
+	    $parent->flush();
+	};
+    }
+    else {
+	$0 .= '.pospipe';
+	close $parent;
+
+	unless(-p $tralnx_conf{pospipe}) {
+	    unlink($tralnx_conf{pospipe});
+	    mkfifo($tralnx_conf{pospipe}, 0770) or mydie("mkfifo() failed: $!");
+	}
+
+	while(1) {
+	    open(FIFO, '>', $tralnx_conf{pospipe}) || mydie("open() failed: $!");
+	    kill(12, getppid());
+	    my $data = <$child>;
+	    print FIFO $data;
+	    close(FIFO);
+	    sleep 1;
+	}
+
+	exit;
+    }
+}
+
+
+my $satellites = 0;
+my $last = 0;
+
+sub deg2int($) {
+    my $deg = shift;
+    my $ideg = int($deg);
+
+    return int($ideg * 1000000 + ($deg - $ideg) * 600000);
+}
+
+sub gpsdData() {
+    my $data = shift;
+    if($data->class eq 'TPV') {
+	my $now = time();
+	
+	# stop if wrong GPS
+	my $zeroP = new GPS::Point;
+	if( ($data->point)->distance($zeroP) == 0.0) {return};
+
+	# send interval
+	if($last + $tralnx_conf{maxinterval} > $now) {
+	    return if($last + $tralnx_conf{interval} > $now  || (defined($lpoint) && $lpoint->distance($data->point) < $tralnx_conf{mindist}))
+	}
+	$last = $now;
+	$lpoint = $data->point;
+
+	# build message
+	my $send;
+	my $mask = 0;
+
+	$mask += 1 << 0;	# REQUIRED
+
+	# Device ID
+	$mask += 1 << 2;
+	$send .= pack('(a22)>', $traccar_conf{'devid'});
+
+	# Date
+	my $dt;
+	if(defined($data->timestamp) || defined($data->time)) {
+	    $dt = $data->datetime;
+	    $mask += 1 << 8;
+	    $send .= pack('(CCC)>',
+		$dt->day,
+		$dt->month,
+		$dt->year - 2000);
+	}
+
+	# GPS status
+	$mask += 1 << 9;
+	$send .= pack('(C)>', $data->mode >= 2);
+
+	# Latitude
+	if(defined($data->lat)) {
+	    $mask += 1 << 10;
+	    $send .= pack('(L)>', deg2int($data->lat));
+	}
+
+	# Longitude
+	if(defined($data->lon)) {
+	    $mask += 1 << 11;
+	    $send .= pack('(L)>', deg2int($data->lon));
+	}
+
+	# Speed
+	if(defined($data->speed)) {
+	    $mask += 1 << 12;
+	    $send .= pack('(S)>', int($data->speed * 10));
+	}
+
+	# Course
+	if(defined($data->track)) {
+	    $mask += 1 << 13;
+	    $send .= pack('(S)>', int($data->track * 10));
+	}
+
+	# Time
+	if(defined($dt)) {
+	    $mask += 1 << 14;
+	    $send .= pack('(CCC)>',
+		$dt->hour,
+		$dt->minute,
+		$dt->second);
+	}
+
+	# GPS status
+	$mask += 1 << 16;
+	$send .= pack('(C)>', $satellites);
+
+
+	$send = pack('(SCCCL)>',
+	    5,		# API
+	    2,		# command type
+	    16,		# message type
+	    4,		# mask flag
+	    $mask,	# mask
+	) . $send;
+
+        my $socket = new IO::Socket::INET(
+		PeerAddr => join(':', $traccar_conf{'host'}, $traccar_conf{'port'}),
+		Proto => 'udp',
+        ) or mydie("failed to create socket: $!");
+	$socket->send($send);
+	close($socket);
+    }
+    elsif($data->class eq 'SKY') {
+	$satellites = $data->used;
+    }
+    elsif($data->class eq 'VERSION') {
+	$logger->info('gpsd: ', $data->release);
+    }
+}
+
+while(1) {
+    
+    
+    my $gpsd = Net::GPSD3->new(%gpsd_conf);
+    $gpsd->addHandler(\&gpsdData);
+
+    eval { $gpsd->watch; };
+
+    $logger->notice("gpsd connection terminated ('$@'), sleeping for 60s...");
+    sleep 60;
+}

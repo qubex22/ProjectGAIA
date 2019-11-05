@@ -1,0 +1,16 @@
+tralnx (0.2) unstable; urgency=low
+
+  * made some small improovements:
+   - avoid sending invalid GPS data in case of no GPS-signal (long=0 and lat=0) this wouln't be necessary if
+     the traccar server would handle invalid data correctly
+     but for now (traccar version 3.7) it shows up in route and so miscalculates the trip distance
+     
+   - script continues working also if internet is interrupted or absent on start.
+
+-- Daniel Till <info@danieltill.de> 
+
+tralnx (0.1) unstable; urgency=low
+
+  * Initial Release.
+
+ -- Thomas Liske <thomas@fiasko-nw.net>  

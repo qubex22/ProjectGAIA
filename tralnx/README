@@ -1,0 +1,38 @@
+tralnx
+======
+
+About
+-----
+tralnx is a traccar client for GNU/Linux written initially by Thomas Liske <thomas@fiasko-nw.net> and modified by Daniel Till.
+It uses gpsd(8) to retrieve and 
+send the current GPS location to a traccar[1] server instance.
+
+[1] http://www.traccar.org/
+
+tralnx rudimentary implements parts of the Skypatrol protocol (only the
+required stuff to get it working with traccar). The protocol uses
+udp port 5021.
+
+
+Installation
+------------
+
+The following perl modules are required:
+
+Log::Dispatch
+Net::GPSD3
+Proc::Daemon
+Proc::PID::File
+
+Net::GPSD3 uses GPS::Point. tralnxd uses the GPS::Point method to
+calculate distances - you need the following addtional packages:
+
+Geo::Inverse
+Geo::Constants
+Geo::Ellipsoids
+Geo::Functions
+
+On Debian those libs are not packaged, you need to fetch them from CPAN[2]
+by yourself.
+
+[2] http://search.cpan.org/~mrdvt/
